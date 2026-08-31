@@ -12,9 +12,6 @@ const config = require('../config/env');
 const logger = require('../utils/logger');
 const SYSTEM_PROMPT = require('../prompts/systemPrompt');
 
-/**
- * Xatoliklarni boshqarish uchun maxsus Error klasi
- */
 class SolverError extends Error {
   constructor(message, code = 'SOLVER_ERROR', statusCode = 500) {
     super(message);
@@ -27,23 +24,18 @@ class SolverError extends Error {
 let genAI;
 let model;
 
-/**
- * Gemini client initializer (Lazy load)
- */
 function getModel() {
   if (model) return model;
 
   try {
     genAI = new GoogleGenerativeAI(config.gemini.apiKey);
-    model = genAI.getGenerativeModel({
-      model: config.gemini.model,
-      systemInstruction: SYSTEM_PROMPT,
-      generationConfig: {
-        temperature: 0.2, // past harorat -> aniq va ishonchli matematik javoblar
-        topP: 0.9,
-        maxOutputTokens: 2048,
+    model = genAI.getGenerativeModel(
+      {
+        model: config.gemini.model || 'gemini-3.6-flash',
+        systemInstruction: SYSTEM_PROMPT,
       },
-    });
+      { apiVersion: 'v1beta' }
+    );
     return model;
   } catch (err) {
     logger.error(`Failed to initialize Gemini client: ${err.message}`);
@@ -55,16 +47,13 @@ function getModel() {
   }
 }
 
-/**
- * Gemini SDK xatolarini ushlab, foydalanuvchiga tushunarli xabarga o'girish
- */
 function handleGeminiError(err) {
   const raw = err?.message || String(err);
   logger.error(`Gemini API error: ${raw}`);
 
-  if (raw.includes('API key not valid') || raw.includes('API_KEY_INVALID') || raw.includes('403')) {
+  if (raw.includes('API key not valid') || raw.includes('API_KEY_INVALID') || raw.includes('403') || raw.includes('401')) {
     return new SolverError(
-      "Gemini API kaliti noto'g'ri yoki ruxsat berilmagan. .env faylini tekshiring.",
+      "Gemini API kaliti noto'g'ri yoki ruxsat berilmagan. Render Environment sozlamalarini tekshiring.",
       'INVALID_API_KEY',
       401
     );
@@ -93,10 +82,14 @@ function handleGeminiError(err) {
   return new SolverError("Kutilmagan xatolik yuz berdi. Iltimos, qaytadan urinib ko'ring.", 'UNKNOWN_ERROR', 500);
 }
 
+const GENERATION_CONFIG = {
+  temperature: 0.1, // Yuqori aniqlik va kamroq keraksiz matn uchun
+  topP: 0.95,
+  maxOutputTokens: 3072, // Javob uzilib qolmasligi uchun kengaytirilgan limit
+};
+
 /**
  * Matnli matematik masalani yechish
- * @param {string} problemText
- * @returns {Promise<string>} O'zbek tilidagi bosqichma-bosqich yechim
  */
 async function solveTextProblem(problemText) {
   if (!problemText || typeof problemText !== 'string' || !problemText.trim()) {
@@ -105,9 +98,15 @@ async function solveTextProblem(problemText) {
 
   try {
     const gModel = getModel();
-    const result = await gModel.generateContent([
-      { text: `Ushbu matematik masalani to'liq o'zbek tilida bosqichma-bosqich yechib bering:\n\n${problemText.trim()}` },
-    ]);
+    const result = await gModel.generateContent({
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: `Ushbu matematik masalani to'liq va aniq yechib bering:\n\n${problemText.trim()}` }],
+        },
+      ],
+      generationConfig: GENERATION_CONFIG,
+    });
 
     const response = result.response;
     const text = response.text();
@@ -125,17 +124,12 @@ async function solveTextProblem(problemText) {
 
 /**
  * Rasmli matematik masalani yechish
- * @param {Buffer} imageBuffer 
- * @param {string} mimeType 
- * @param {string} [captionText] 
- * @returns {Promise<string>} O'zbek tilidagi bosqichma-bosqich yechim
  */
 async function solveImageProblem(imageBuffer, mimeType, captionText = '') {
   if (!imageBuffer || !Buffer.isBuffer(imageBuffer) || imageBuffer.length === 0) {
     throw new SolverError("Yaroqli rasm ma'lumotlari taqdim etilmadi.", 'EMPTY_IMAGE', 400);
   }
 
-  // Telegram Hujjat (Document) rejimida yuborilgan rasmlarni qo'llab-quvvatlash
   let validMimeType = mimeType;
   if (!validMimeType || validMimeType === 'application/octet-stream') {
     validMimeType = 'image/jpeg';
@@ -144,7 +138,7 @@ async function solveImageProblem(imageBuffer, mimeType, captionText = '') {
   const allowedMimeTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'];
   if (!allowedMimeTypes.includes(validMimeType)) {
     throw new SolverError(
-      `Qo'llab-quvvatlanmaydigan rasm formati: "${mimeType}". Iltimos, JPEG, PNG yoki WEBP rasmini yuboring.`,
+      `Qo'llab-quvvatlanmaydigan rasm formati: "${mimeType}". Iltimos, JPEG yoki PNG rasmini yuboring.`,
       'UNSUPPORTED_IMAGE_TYPE',
       415
     );
@@ -154,18 +148,26 @@ async function solveImageProblem(imageBuffer, mimeType, captionText = '') {
     const gModel = getModel();
 
     const promptText = captionText && captionText.trim()
-      ? `Rasmdagi matematik masalani foydalanuvchining ushbu izohini inobatga olgan holda o'zbek tilida yechib bering: "${captionText.trim()}"`
-      : "Rasmdagi matematik masalani diqqat bilan o'qib, uni o'zbek tilida bosqichma-bosqich yechib bering.";
+      ? `Rasmdagi masalani quyidagi izohga ko'ra yechib bering: "${captionText.trim()}"`
+      : "Rasmdagi matematik masalani va barcha belgilarni aniq o'qib, bosqichma-bosqich yechib bering.";
 
-    const result = await gModel.generateContent([
-      { text: promptText },
-      {
-        inlineData: {
-          data: imageBuffer.toString('base64'),
-          mimeType: validMimeType,
+    const result = await gModel.generateContent({
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            { text: promptText },
+            {
+              inlineData: {
+                data: imageBuffer.toString('base64'),
+                mimeType: validMimeType,
+              },
+            },
+          ],
         },
-      },
-    ]);
+      ],
+      generationConfig: GENERATION_CONFIG,
+    });
 
     const response = result.response;
     const text = response.text();
